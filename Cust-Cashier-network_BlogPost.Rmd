@@ -1,0 +1,233 @@
+---
+title: Fraud identification using network analysis of Customer and Cashier – “Sweet
+  Hearting”
+author: "Parakram Jain"
+date: "January 20, 2020"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##### Today we are targeting “Sweet hearting”, this one occurs when the cashier colludes with the customer and either doesn’t scan the item or applies a discount where one isn’t applicable. This discount could be in the form of altering the price.    
+##### Loss Prevention in retail consists of items such as internal theft, cashier intentionally not scanning an item or external theft by customers. Loss due to this is a significant percentage in the balance sheet. Making the Loss Prevention activities efficient can translate into substantial amount of dollars of savings on an annual basis.  
+##### We are taking an approach of network analysis to identify sweet hearting phenomena happening between cashier and customer. I am presenting use case from retail but this can be extended to any other area where bulk transactions are happening and potential opportunity of sweet hearting can arise.  
+##### Let’s go thru some basics first before diving into code.  
+##### Primary aspect of any network is the presence of two entities and a connection between them. Entities are the nodes and the connections are the edges. We can also attribute some additional feature to nodes and edges to show other parameters like the width of the edge can represent the strength of the relationship between two nodes. Color and shape of the nodes can be used to identify different entities. Many other creative ways provided by R library which you use and show various features but that I’ll leave it to you to explore.  
+##### In this use case we are focusing on two entities Cashier and Customer. The transactions happening between two the entity will represent the relationship between them.  
+
+##### Nodes: Cashier, Customer  
+##### Edges: Transaction between them  
+##### Edge property thickness: number of transaction (where price alteration happened) will be used to represent the thickness  
+##### Dataset contain following columns – Cashier ID, Customer ID, Transaction ID, Price alteration indicator  
+
+###################################################################
+### Load libraries
+###################################################################
+```{r results='hide', message=FALSE, warning=FALSE}
+suppressWarnings({
+  library(tidyverse)
+  library(modelr)
+  library(broom)
+  library(dplyr)
+  library(igraph)
+  library(dplyr)
+  library(sparklyr)
+  library(visNetwork)
+  library(chron)
+  library(knitr)
+})
+```
+
+# ##################################################################
+### Get the data
+# ##################################################################
+```{r echo=FALSE}
+# Set working directory
+path <- 'C:/Users/pajain/OneDrive - George Weston Limited-6469347-MTCAD/Analytics/POC/Loss Prevention/store_transaction.csv'
+
+```
+
+```{r}
+# Read the column headers
+store_transaction_df  <- read.csv(path, header  = TRUE)
+```
+# ##################################################################
+### Perform data processing in case you need to  
+#### Total number of rows under analysis
+# ##################################################################
+```{r echo=FALSE, warning=FALSE}
+# Filter data for few Sites
+Site_selection <- c(1570, 1525, 1511, 1551)
+store_transaction_df <- store_transaction_df %>% filter(Site_Id %in% Site_selection)
+
+nrow(store_transaction_df)
+
+# Rename rows to lowercase
+store_transaction_df <- store_transaction_df %>% select_(.dots = setNames(colnames(store_transaction_df), tolower(colnames(store_transaction_df))))
+
+store_transaction_df_bkup <- store_transaction_df
+```
+
+# ##################################################################
+### Lets look at the sample data  
+# ##################################################################
+```{r echo=FALSE}
+# Create Transaction time from timestamp
+store_transaction_df$transaction_time <- substr(store_transaction_df$trans_dtl_line_timestamp_max,12,19)
+store_transaction_df$transaction_time <- chron(times. = store_transaction_df$transaction_time)
+
+# Filter data for cashier-hash/pcp interactions based on the Price alteration
+store_transaction_df$customer <- store_transaction_df$hash_account_cd_1
+store_transaction_df$store <- store_transaction_df$site_id
+
+store_transaction_df_sample <- store_transaction_df %>% 
+  filter(pcp_plus_card_num != "~") %>%
+  mutate(cashier = paste0(site_id,"_",cashier_num), 
+         alt_price_amt_total = abs(alternate_price_amt), 
+         Alt_price_qty_total = abs(alternate_price_qty), 
+         Line_void_total = abs(line_void_cnt)) %>%
+  select(transaction_dt, store, cashier, customer, alternate_price_cnt_tot, total_amt, alternate_price_amt, void_qty, alt_price_amt_total,Alt_price_qty_total, Line_void_total) 
+
+store_transaction_df_sample <- store_transaction_df_sample %>% mutate(store = paste0(store,""))
+
+# Prep data for social network analysis
+store_transaction_df_sample <- data.frame(store_transaction_df_sample)
+
+kable(head(store_transaction_df_sample), caption = "Dataframe Headrer ")
+
+```
+
+
+# ##################################################################
+#### Create the nodes of the graph:
+##### Filter the data frame to keep only those transaction for which price alteration happened.
+# ##################################################################
+```{r}
+store_nodes <- store_transaction_df_sample %>%
+  group_by(store) %>%
+  summarize(n_transactions = n()) %>%
+  mutate(
+    node.type = 1,
+    type.label = "Store"
+  ) %>%
+  rename(id = store)
+
+store_nodes$id <- paste(store_nodes$id,"")
+
+cashier_nodes <- store_transaction_df_sample %>%
+  group_by(cashier) %>%
+  summarize(n_transactions = n()) %>%
+  mutate(
+    node.type = 2,
+    type.label = "Cashier"
+  ) %>%
+  rename(id = cashier)
+
+customer_nodes <- store_transaction_df_sample %>%
+  filter(customer != "~" & customer != "NA") %>%
+  group_by(customer) %>%
+  summarize(n_transactions = n()) %>%
+  mutate(
+    node.type = 3,
+    type.label = "Customer"
+  ) %>%
+  rename(id = customer)
+
+```
+
+# ##################################################################
+#### Create the edges of the graph
+# ##################################################################
+```{r}
+cashier_store_edges <- store_transaction_df_sample %>%
+  group_by(cashier, store) %>%
+  summarize(weight = n(), alt_total_line_void = 1) %>%
+  mutate(type = "works_at", weight = 1, store = paste(store,"") ) %>%
+  rename(from = cashier, to = store)
+
+customer_cashier_edges <- store_transaction_df_sample %>%
+  filter(customer != "~" & customer != "NA") %>%
+  group_by(customer, cashier) %>%
+  summarize(weight = n(), alt_total_line_void = (sum(alternate_price_cnt_tot) + (-1)*sum(void_qty))) %>%
+  mutate(type = "applied_discount") %>%
+  rename(from = customer, to = cashier)
+
+```
+
+# ##################################################################
+#### Keeping all the customers and cashier will make the network graph hard to understand, so I have applied transaction level threshold in this case if any cashier who did more than 25 price alteration for a customer will be in radar.
+# ##################################################################
+#### As many edges are filtered out just redo the nodes data frame by keeping only those nodes which belong to price alteration above threshold.
+```{r warning=FALSE}
+threshold <- 25
+customer_cashier_edges_filtered <- customer_cashier_edges %>% filter(alt_total_line_void > threshold) 
+customer_nodes_filtered <- semi_join(x = customer_nodes, y = customer_cashier_edges_filtered, by = c("id" = "from"))
+cashier_nodes_filtered <- semi_join(x = cashier_nodes, y = customer_cashier_edges_filtered, by = c("id" = "to"))
+cashier_store_edges_filtered <- semi_join(x = cashier_store_edges, y = cashier_nodes_filtered, by = c("from" = "id"))
+store_nodes_filtered <- semi_join(x=store_nodes, y = cashier_store_edges_filtered, by = c("id" = "to"))
+```
+
+#### Create the final nodes and edge data frame and look ar the sample
+```{r warning=FALSE}
+nodes <- rbind(store_nodes_filtered, cashier_nodes_filtered, customer_nodes_filtered)
+edges <- rbind(cashier_store_edges_filtered, customer_cashier_edges_filtered) %>% arrange(alt_total_line_void)
+kable(head(edges), caption = "Sample Edges ")
+kable(head(nodes), caption = "Sample Nodes ")
+```
+
+
+# ##############################################################################
+#### As discussed earlier you can set various properties of nodes and edges to make the network interpretable.
+# ##############################################################################
+
+```{r}
+nodes$shape <- "dot"  
+nodes$shadow <- TRUE # Nodes will drop shadow
+nodes$title <- nodes$type.label # Text on click
+nodes$label <- paste(nodes$type.label," - ", substr(nodes$id,1,8)) # Node label
+nodes$color.background <- c("slategrey", "tomato", "gold", "lightblue", "darkblue")[nodes$node.type]
+nodes$color.border <- "black"
+nodes$color.highlight.background <- "orange"
+nodes$color.highlight.border <- "darkred"
+
+edges$width <- round((1 + edges$alt_total_line_void/100),0)  #/8 # line width
+edges$label <- round(edges$alt_total_line_void,0)
+
+colfunc <- colorRampPalette(c("green", "red"))
+
+edges$color <- colfunc(length(edges$alt_total_line_void))    # line color  
+edges$smooth <- FALSE    # should the edges be curved?
+edges$shadow <- FALSE    # edge shadow
+```
+
+#### Now we are ready to build the interactive network of customer and cashier
+
+```{r}
+visNetwork(nodes, edges, main = "CASHIER CUSTOMER INTERACTIONS",submain = paste("Number of price alteration done by cashier for a customer")) %>%  visInteraction(navigationButtons = TRUE)
+
+
+#.
+
+```
+
+#### Summary
+##### We can see that this store has the number of cases for which price alteration is done for same customer. Also, we can see that specific edge only show high alteration number for customer, which indicate that if customer is going to that cashier then only price alterations are happening on many products. This analysis gives pointers to take further investigation into suspected relationships.  
+
+* Insights:
+    + Cashier - Customer interaction attributing to Price alteration will highlight if any malicious activity is going on at the store
+    + This can also point out the training needs for cashiers
+    +	Suspected sites can be invigilated further to drill down to the problem, if possible video surveillance will help in this case 
+    + This network helps in focusing the investigation to few sites or groups of cashiers instead of applying the fraud prevention policies across the store or group of stores.
+
+* Other use cases:
+    + This network can also be created for various product and stores incurring loss to get better understanding of Loss and can help in Loss prevention
+    +	Real-time network graph of product inventory and site would he helpful in managing inventory between nearby stores
+
+##### Reference
+##### Explore visNetwork library to understand various other features provided by the package.
+##### .
+##### .
